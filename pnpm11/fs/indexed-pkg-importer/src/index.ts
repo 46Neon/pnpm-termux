@@ -57,17 +57,25 @@ function createAutoImporter (): ImportIndexedPackage {
     to: string,
     opts: ImportOptions
   ): string | undefined {
+    // Android application sandboxes (including Termux) commonly reject
+    // hardlinks/reflinks between the store and a project. Probing those
+    // operations can leave a partial package behind and make pnpm appear
+    // to stop. Use the atomic copy importer up front on Termux; users can
+    // opt back into link probing with PNPM_TERMUX_LINK_MODE=auto.
+    if (isTermux() && process.env.PNPM_TERMUX_LINK_MODE !== 'auto') {
+      packageImportMethodLogger.debug({ method: 'copy', reason: 'termux' })
+      globalInfo('Termux detected: using copy mode for package imports')
+      auto = copyPkg
+      return auto(to, opts)
+    }
     // Although reflinks are supported on Windows Dev Drives,
     // they are 10x slower than hard links.
     // Hence, we prefer reflinks by default only on Linux and macOS.
     if (process.platform !== 'win32') {
       try {
         // Probe with the raw clone function (no ENOTSUP fallback).
-        // On filesystems that don't support reflinks (e.g. ext4), this
-        // throws and we fall through to hardlinks — which is much faster
-        // than copying.  If the probe succeeds, we switch to the full
-        // clone importer (with ENOTSUP fallback for transient failures
-        // during heavy parallel I/O) for all subsequent packages.
+        // On filesystems that do not support reflinks, this throws and we
+        // fall through to hardlinks.
         if (!tryClonePkg(to, opts)) return undefined
         packageImportMethodLogger.debug({ method: 'clone' })
         auto = createClonePkg()
@@ -83,10 +91,10 @@ function createAutoImporter (): ImportIndexedPackage {
       return 'hardlink'
     } catch (err: unknown) {
       assert(util.types.isNativeError(err))
-      if (err.message.startsWith('EXDEV: cross-device link not permitted')) {
+      if (isLinkUnsupportedError(err)) {
         globalWarn(err.message)
         globalInfo('Falling back to copying packages from store')
-        packageImportMethodLogger.debug({ method: 'copy' })
+        packageImportMethodLogger.debug({ method: 'copy', reason: err.code })
         auto = copyPkg
         return auto(to, opts)
       }
@@ -126,8 +134,6 @@ type CloneFunction = (src: string, dest: string) => void
 /**
  * Import a single package using a raw clone function (no ENOTSUP fallback).
  * Used by auto-mode to probe whether the filesystem supports cloning.
- * If cloning isn't supported, the error propagates so the caller can fall
- * through to a faster method (e.g. hardlinks).
  */
 function tryClonePkg (
   to: string,
@@ -143,12 +149,9 @@ function tryClonePkg (
 }
 
 /**
- * Creates a clone-based package importer.  Reflinks are atomic, so clone can
- * serve as both importFile and importFileAtomic.  However, on Linux
- * copy_file_range can transiently fail with ENOTSUP under heavy parallel I/O,
- * so we fall back to copy on ENOTSUP.  Regular files use a simple copy;
- * package.json (the completion marker) uses a temp+rename fallback to stay
- * atomic.
+ * Creates a clone-based package importer. Reflinks are atomic, so clone can
+ * serve as both importFile and importFileAtomic. Transient clone failures
+ * fall back to regular copy.
  */
 function createClonePkg (): ImportIndexedPackage {
   const clone = createCloneFunction()
@@ -183,8 +186,7 @@ function pkgExistsAtTargetDir (targetDir: string, filesMap: FilesMap): boolean {
 
 function pickFileFromFilesMap (filesMap: FilesMap): string {
   // New packages always have a package.json (the worker synthesizes one if
-  // the tarball/directory lacks it).  The fallback handles old store entries
-  // that were indexed before the synthetic package.json was introduced.
+  // the tarball/directory lacks it). The fallback handles old store entries.
   if (filesMap.has('package.json')) {
     return 'package.json'
   }
@@ -198,8 +200,6 @@ let _cloneFunction: CloneFunction | undefined
 
 function createCloneFunction (): CloneFunction {
   if (_cloneFunction) return _cloneFunction
-  // Node.js currently does not natively support reflinks on Windows and macOS.
-  // Hence, we use a third party solution.
   if (process.platform === 'darwin' || process.platform === 'win32') {
     // eslint-disable-next-line
     const { reflinkFileSync } = require('@reflink/reflink') as typeof import('@reflink/reflink')
@@ -207,9 +207,6 @@ function createCloneFunction (): CloneFunction {
       try {
         reflinkFileSync(fr, to)
       } catch (err: unknown) {
-        // If the file already exists, then we just proceed.
-        // This will probably only happen if the package's index file contains the same file twice.
-        // For instance: { "index.js": "hash", "./index.js": "hash" }
         if (!util.types.isNativeError(err) || !('code' in err) || err.code !== 'EEXIST') throw err
       }
     }
@@ -253,23 +250,26 @@ function shouldRelinkPkg (
   return opts.resolvedFrom !== 'store' || !pkgLinkedToStore(opts.filesMap, to)
 }
 
+function isTermux (): boolean {
+  return process.platform === 'android' || process.env.TERMUX_VERSION != null ||
+    (process.env.PREFIX?.includes('/com.termux/') ?? false)
+}
+
+function isLinkUnsupportedError (err: NodeJS.ErrnoException): boolean {
+  return err.code === 'EXDEV' || err.code === 'EPERM' || err.code === 'EACCES' ||
+    err.code === 'ENOTSUP' || err.code === 'EOPNOTSUPP' || err.code === 'EINVAL' ||
+    err.message.startsWith('EXDEV: cross-device link not permitted')
+}
+
 function linkOrCopy (existingPath: string, newPath: string): void {
   try {
     fs.linkSync(existingPath, newPath)
   } catch (err: unknown) {
-    // If a hard link to the same file already exists
-    // then trying to copy it will make an empty file from it.
     if (util.types.isNativeError(err) && 'code' in err && err.code === 'EEXIST') return
-    // In some VERY rare cases (1 in a thousand), hard-link creation fails on Windows.
-    // In that case, we just fall back to copying.
-    // This issue is reproducible with "pnpm add @material-ui/icons@4.9.1"
     resilientCopyFileSync(existingPath, newPath)
   }
 }
 
-// On Linux CI, the kernel's copy_file_range/sendfile can transiently fail
-// with ENOTSUP under heavy parallel I/O on the same store files.
-// Fall back to manual read+write which uses plain read/write syscalls.
 function resilientCopyFileSync (src: string, dest: string): void {
   try {
     fs.copyFileSync(src, dest)
@@ -303,9 +303,6 @@ export function copyPkg (
   opts: ImportOptions
 ): 'copy' | undefined {
   if (opts.resolvedFrom !== 'store' || opts.force || !pkgExistsAtTargetDir(to, opts.filesMap)) {
-    // copyFileSync is not atomic on non-COW filesystems: a crash mid-copy
-    // can leave a partially-written file.  package.json is the completion
-    // marker, so it must be written atomically via temp file + rename.
     importIndexedDir({ importFile: resilientCopyFileSync, importFileAtomic: atomicCopyFileSync }, to, opts.filesMap, opts)
     removeQuarantineFromNativeBinaries(to, opts)
     return 'copy'
@@ -326,13 +323,6 @@ function atomicCopyFileSync (src: string, dest: string): void {
   renameOverwriteSync(tmp, dest)
 }
 
-// macOS preserves the com.apple.quarantine xattr when files are copied or
-// reflinked out of the store, and for hardlinks the imported file shares the
-// store blob's inode (and thus its xattrs). Either way Gatekeeper can block a
-// native binary from loading. Drop the quarantine once, in a single batched
-// `xattr` call per package, restricted to the few native binaries that
-// Gatekeeper actually guards. Only store imports are cleaned: that's where the
-// quarantine propagation happens and where pnpm has verified file integrity.
 function removeQuarantineFromNativeBinaries (to: string, opts: ImportOptions): void {
   if (process.platform !== 'darwin' || opts.resolvedFrom !== 'store') return
   const nativeBinaries: string[] = []
