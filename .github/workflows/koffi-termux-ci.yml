@@ -1,0 +1,71 @@
+name: Koffi Termux CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pnpm11/**'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/koffi-termux-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: koffi-termux-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  termux-arm64:
+    name: Termux Android ARM64
+    runs-on: [self-hosted, arm64, android, termux]
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Android ARM64 Termux runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node -e 'if (process.platform !== "android" || process.arch !== "arm64") process.exit(1)'
+          test -n "${TERMUX_VERSION:-}"
+          test "${PREFIX:-}" = "/data/data/com.termux/files/usr"
+          node --version
+          pnpm --version
+      - name: Install reproducibly
+        run: pnpm install --frozen-lockfile
+      - name: Compile pnpm
+        run: pn ci:compile
+      - name: Test pnpm
+        run: pn --filter pnpm test
+      - name: Build pnpm
+        run: pn --filter pnpm build
+      - name: Verify built CLI
+        run: |
+          node pnpm11/pnpm/bin/pnpm.mjs --version
+          node pnpm11/pnpm/bin/pnpm.mjs --help >/dev/null
+      - name: Create checksum artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f pnpm11/pnpm/dist/pnpm.mjs
+          mkdir -p artifacts/koffi-termux/package
+          cp pnpm11/pnpm/package.json pnpm11/pnpm/pnpmrc artifacts/koffi-termux/package/
+          cp -R pnpm11/pnpm/bin pnpm11/pnpm/dist artifacts/koffi-termux/package/
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf artifacts/koffi-termux/pnpm-termux-android-arm64.tar.gz \
+            -C artifacts/koffi-termux package
+          sha256sum artifacts/koffi-termux/pnpm-termux-android-arm64.tar.gz \
+            > artifacts/koffi-termux/pnpm-termux-android-arm64.tar.gz.sha256
+      - name: Upload Termux artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: koffi-termux-android-arm64-${{ github.sha }}
+          path: artifacts/koffi-termux/
+          if-no-files-found: error
+          retention-days: 30
+
